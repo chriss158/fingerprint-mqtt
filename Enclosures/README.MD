@@ -1,5 +1,5 @@
 # Enclosures
-Enclosures for your fingerprint sensors! STL's intended for 3d printing...choose whichever suits you.
+Enclosures for your fingerprint sensors! STL's intended for 3d printing...choose whichever suits you.\
 
 ## Sensor + Wemos (Wall Mount)
 This enclosure will house an FPM10A and Wemos D1 Mini, and is intended for wall mounting.\
