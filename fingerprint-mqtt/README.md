@@ -18,7 +18,7 @@ Same as fingerprint-mqtt-led.ino, but in addition implements module's built-in t
 
 # fingerprint-mqtt-led-touch-oled.ino
 
-Same as fingerprint-mqtt-led-touch.ino, but in addition implements OLED functionality.  Note the following important changes!
+Same as fingerprint-mqtt-led-touch.ino, but in addition implements OLED functionality, and OTA updating (as this model lives inside a wall, and not easily accessible).  Note the following important changes!
 
 - MQTT structure differs from other methods:
   - The sensor publishes the following:
