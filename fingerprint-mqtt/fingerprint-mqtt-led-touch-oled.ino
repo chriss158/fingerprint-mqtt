@@ -5,20 +5,22 @@
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <ArduinoOTA.h>
+#include <ESP8266mDNS.h>
+#include <WiFiUdp.h>
 
 // Wifi Settings
 #define SSID                          "Your Wifi SSID Here"
-#define PASSWORD                      "Your WiFi Password Here"
+#define PASSWORD                      "Your Wifi Password Here"
 
 // MQTT Settings
 #define HOSTNAME                      "fingerprint-sensor-1"
 #define MQTT_SERVER                   "Your MQTT Server here"														
+#define STATE_TOPIC                   "fingerprint_sensor/1/state"        //Publish state changes to this topic
+#define LAST_TOPIC                    "fingerprint_sensor/1/last"         //Publish last results to this topic
+#define REQUEST_TOPIC                 "fingerprint_sensor/1/request"      //Listen here for requests, such as a request to enroll
+#define NOTIFY_TOPIC                   "fingerprint_sensor/1/notify"       //Listen here for text to display on the OLED, such as an automation notification
 #define AVAILABILITY_TOPIC            "fingerprint_sensor/1/available"
-#define STATE_TOPIC                   "fingerprint_sensor/1/state"        //We will publish state changes to this topic
-#define ATTR_TOPIC                    "fingerprint_sensor/1/attributes"   //We will publish additional attributes to this topic
-#define REQUEST_TOPIC                 "fingerprint_sensor/1/request"      //We will listen here for requests, such as a request to enroll
-#define NOTIFY_TOPIC                   "fingerprint_sensor/1/notify"      //We will listen here for notifications to display on the OLED, such as an automation run from HA
-
 #define mqtt_username                 "Your MQTT Username"
 #define mqtt_password                 "Your MQTT Password"
 
@@ -27,14 +29,8 @@
 #define SENSOR_RX 12                  //GPIO Pin for WEMOS TX, SENSOR RX
 #define SENSOR_TOUT 14                //GPIO Pin for SENSOR T_OUT
 
-// OLED Settings
+// OLED
 #define OLED_RESET -1
-#define SCREENSAVER_ON_DELAY 120      // Idle time before screensaver (in seconds)
-#define SCREENSAVER_REFRESH 15        // Refresh time for the screensaver (in seconds)
-
-// OLED Variables
-unsigned long millis_last_scan;       // Stores time of last scan (for screensaver)
-unsigned long millis_last_refresh;    // Stores time of last refresh (for screensaver)
 
 // OLED Bitmaps
 const unsigned char wifi_conn_ico [] PROGMEM = {
@@ -58,20 +54,21 @@ const unsigned char mqtt_disc_ico [] PROGMEM = {
 0xc1, 0x90, 0x7f, 0xc0, 0x00, 0x40, 0x00, 0x00
 };
 
-// FP variables
-int id = 0;                           // Stores the current fingerprint ID
-int confidenceScore = 0;              // Stores the current confidence score
-
-Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
-
 SoftwareSerial mySerial(SENSOR_TX, SENSOR_RX);
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+Adafruit_SSD1306 display(128, 64, &Wire, OLED_RESET);
 
 WiFiClient wifiClient;                // Initiate WiFi library
 PubSubClient client(wifiClient);      // Initiate PubSubClient library
 bool wifiState = false;               // Stores wifi connectivity state for OLED
 bool mqttState = false;               // Stores mqtt connectivity state for OLED
 
+int id = 0;                           // Stores the current fingerprint ID
+int confidenceScore = 0;              // Stores the current confidence score
+
+unsigned long millis_last_scan;       // Stores time of last scan (for screensaver)
+int screensaver_delay = 60;            // Idle time before screensaver (in seconds)
 
 //Declare JSON variables
 DynamicJsonDocument mqttMessage(200);
@@ -85,7 +82,7 @@ void setup(){
   display.setTextColor(SSD1306_WHITE);
   display.cp437(true);
 
-  pinMode(SENSOR_TOUT, INPUT);
+  pinMode(SENSOR_TOUT, INPUT); // Connect WEMOS 14(D5) to T-Out, T-3v to 3v
 
   oledUpdateHeader("SENSOR:TRYING", false, false);
   
@@ -103,24 +100,56 @@ void setup(){
   // connect to wifi
   WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSWORD);
-  oledUpdateHeader("WIFI:TRYING", false, false);
+  oledUpdateHeader("WIFI:TRYING", wifiState, mqttState);
   while (WiFi.status() != WL_CONNECTED) {       // Wait till Wifi connected
     delay(1000);
   }
   wifiState = true;
-  oledUpdateHeader("WIFI:CONNECTED", wifiState, false);
+  oledUpdateHeader("WIFI:CONNECTED", wifiState, mqttState);
   delay(500);
+
+  // OTA prep
+  ArduinoOTA.onStart([]() {
+    String type;
+    if (ArduinoOTA.getCommand() == U_FLASH) {
+      type = "sketch";
+    } else { // U_FS
+      type = "filesystem";
+    }
+  });
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    oledUpdateHeader("FLASHING...", wifiState, mqttState);
+  });
+  ArduinoOTA.onEnd([]() {
+    oledUpdateHeader("FLASH COMPLETE", wifiState, mqttState);
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) {
+      oledUpdateHeader("AUTH FAIL", wifiState, mqttState);
+    } else if (error == OTA_BEGIN_ERROR) {
+      oledUpdateHeader("BEGIN FAIL", wifiState, mqttState);
+    } else if (error == OTA_CONNECT_ERROR) {
+      oledUpdateHeader("CONNECT FAIL", wifiState, mqttState);
+    } else if (error == OTA_RECEIVE_ERROR) {
+      oledUpdateHeader("RECIEVE FAIL", wifiState, mqttState);
+    } else if (error == OTA_END_ERROR) {
+      oledUpdateHeader("END FAIL", wifiState, mqttState);
+    }
+  });
+  ArduinoOTA.begin();
 
   // connect to mqtt server
   client.setServer(MQTT_SERVER, 1883);                  // Set MQTT server and port number
   client.setCallback(callback);
-  oledUpdateHeader("MQTT:TRYING", wifiState, false);
+  oledUpdateHeader("MQTT:TRYING", wifiState, mqttState);
   delay(500);
   reconnect();                                          //Connect to MQTT server
   oledUpdateHeader("MQTT:CONNECTED", wifiState, mqttState);
   delay(500);
-  // publish initial state
-  publishState("idle");
+  // set initial state
+  oledUpdateHeader("READY", wifiState, mqttState);
+  publishState("idle",0,0);
   delay(500);
 }
 
@@ -128,61 +157,57 @@ void setup(){
 
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED || !client.connected()){              // if wifi or mqtt are disconnected...
-    while (WiFi.status() != WL_CONNECTED) {                               // if it was wifi...wait for connection
-      oledUpdateHeader("WIFI:TRYING", false, false);                      
+  ArduinoOTA.handle();
+  if (WiFi.status() != WL_CONNECTED || !client.connected()){
+    while (WiFi.status() != WL_CONNECTED) {
+      oledUpdateHeader("WIFI:TRYING", false, false);
       delay(500);
     }
     oledUpdateHeader("WIFI:CONNECTED", true, false);
     delay(500);
-    if (!client.connected()) {                                            // if it was mqtt...
+    if (!client.connected()) {
       oledUpdateHeader("MQTT:TRYING", true, false);
-      reconnect();                                                        // this routine waits for a connection
+      reconnect();                //Just incase we get disconnected from MQTT server
       oledUpdateHeader("MQTT:CONNECTED", true, true);
       delay(500);
     }
   }
- 
-  if(millis() > millis_last_scan + SCREENSAVER_ON_DELAY*1000){            // been idle long enough for the screensaver?
-    if (millis() > millis_last_refresh + SCREENSAVER_REFRESH*1000){       // and if so should we refresh the screen image?
-      oledRefreshScreensaver();                                           // refresh the screensaver
-      millis_last_refresh = millis();                                     // reset refresh timer
-    }
-  } else {
-   oledUpdateHeader("READY", true, true);
-  }
-  
-  int fingerState = digitalRead(SENSOR_TOUT);                             // read T-Out, normally HIGH (when no finger)
-  if (fingerState == HIGH) {                                              // if no finger turn off the LED
+  oledUpdateHeader("READY", true, true);
+
+  int fingerState = digitalRead(SENSOR_TOUT); // Read T-Out, normally HIGH (when no finger)
+  if (fingerState == HIGH) {
     finger.LEDcontrol(false);
-  } else {                                                                // otherwise something is present...
+  } else {
     oledUpdateHeader("HOLD STILL", true, true);
     oledTextSwipeUp("SCANNING",2,18,64,30,10); 
-    delay(250);                                                           // this delay plus the animation above gives the finger time to land and settle for a good read
-    uint8_t result = getFingerprintID();                                  // read fingerprint
-    delay(500);                                                           // this delay is purely for the OLED UI
-    if (result == FINGERPRINT_OK) {                                       // if matched...
-      publishState("matched");
-      publishAttr("matched",id,confidenceScore);
+    delay(250); //this delay plus the animation above gives the finger time to land and settle for a good read
+    uint8_t result = getFingerprintID();
+    delay(500); //this delay is purely for the OLED UI
+    if (result == FINGERPRINT_OK) {
+      publishState("matched",id,confidenceScore);
+      publishLast("matched",id,confidenceScore);
       oledUpdateHeader("SENDING", true, true);
       oledTextSwipeDown("MATCHED",2,25,30,64,10);
       delay(500);
-    } else if (result == FINGERPRINT_NOTFOUND) {                          // if not matched...
-      publishState("not matched");
-      publishAttr("not matched",0,0);
+    } else if (result == FINGERPRINT_NOTFOUND) {
+      publishState("not matched",0,0);
+      publishLast("not matched",0,0);
       oledUpdateHeader("SENDING", true, true);
       oledTextSwipeDown("CHECKING",2,16,30,64,10);
       delay(500);
-    } else {                                                              // in any other case...
-      publishState("bad scan");
-      publishAttr("bad scan",0,0);
+    } else {
+      publishState("bad scan",0,0);
+      publishLast("bad scan",0,0);
       oledTextSwipeDown("CHECKING",2,16,30,64,10);
     }
-    publishState("idle");
+    publishState("idle",0,0);
     millis_last_scan = millis();
   }
   client.loop();
-  delay(100);                                                             //don't need to run this at full speed.
+  delay(100);            //don't need to run this at full speed.
+  if(millis() > millis_last_scan + screensaver_delay*1000){
+    oledScreensaver();
+  }
 }
 
 
@@ -378,8 +403,10 @@ void reconnect() {
       client.publish(AVAILABILITY_TOPIC, "online");         // Once connected, publish online to the availability topic
       client.subscribe(REQUEST_TOPIC);
       client.subscribe(NOTIFY_TOPIC);
+      mqttState = true;
     } else {
       delay(5000);  // Will attempt connection again in 5 seconds
+      mqttState = false;
     }
   }
 }
@@ -409,16 +436,16 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
         bool enrolled = false;
         while (enrolled != true){
           oledUpdateHeader( h1, true, true);
-          publishState("learning");
-          publishAttr("learning", id, 0);
+          publishState("learning", id, 0);
+          publishLast("learning", id, 0);
           enrolled = getFingerprintEnroll(id);  //stay inside enroll routine until returns true (learn success)
         }
         oledUpdateHeader("SUCCESS!", true, true);
         oledTextSwipeLeft("REMOVE",30,30,"STORED",30,30,15);
         delay(2000);
         oledTextSwipeDown("STORED",2,30,30,64,10);
-        publishState("learned");
-        publishAttr("learned", id, 0);
+        publishState("learned", id, 0);
+        publishLast("learned", id, 0);
       } else {
         oledUpdateHeader("INVALID ID", true, true);
         delay(2000);
@@ -431,13 +458,13 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
         char h1[16] = "DELETING ID ";
         strcat(h1,idChar);
         oledUpdateHeader( h1, true, true);
-        publishState("deleting");
-        publishAttr("deleting", id, 0);
+        publishState("deleting", id, 0);
+        publishLast("deleting", id, 0);
         delay(500);
         while (!deleteFingerprint(id));
         oledUpdateHeader("DELETED", true, true);
-        publishState("deleted");
-        publishAttr("deleted", id, 0);
+        publishState("deleted", id, 0);
+        publishLast("deleted", id, 0);
         delay(500);
       } else {
         oledUpdateHeader("INVALID ID", true, true);
@@ -471,19 +498,21 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
     delay(1500);
     oledTextSwipeDown(messageTxt,1,oledGetX(messageTxt, 5, 1, 128),30,64,10);
   }
-  publishState("idle");
+  publishState("idle", 0, 0);
 }
-void publishState(char* state){
-//  mqttMessage["state"] = state;
-//  size_t mqttMessageSize = serializeJson(mqttMessage, mqttBuffer);
-  client.publish(STATE_TOPIC, state);
-}
-void publishAttr(char* state,int id, int conf){
-  mqttMessage["last_state"] = state;
-  mqttMessage["last_id"] = id;
-  mqttMessage["last_confidence"] = conf;
+void publishState(char* state,int id, int conf){
+  mqttMessage["state"] = state;
+  mqttMessage["id"] = id;
+  mqttMessage["confidence"] = conf;
   size_t mqttMessageSize = serializeJson(mqttMessage, mqttBuffer);
-  client.publish(ATTR_TOPIC, mqttBuffer, mqttMessageSize);
+  client.publish(STATE_TOPIC, mqttBuffer, mqttMessageSize);
+}
+void publishLast(char* state,int id, int conf){
+  mqttMessage["state"] = state;
+  mqttMessage["id"] = id;
+  mqttMessage["confidence"] = conf;
+  size_t mqttMessageSize = serializeJson(mqttMessage, mqttBuffer);
+  client.publish(LAST_TOPIC, mqttBuffer, mqttMessageSize);
 }
 
 
@@ -587,11 +616,25 @@ void oledShake(char* textStr, int xStart, int yStart) {
     display.display();
   }
 }
-void oledRefreshScreensaver(){
+void oledScreensaver(){
+  bool fingerPlaced = false;
+  unsigned int i = 10000;
+  unsigned long t = 0;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(random(0,98),random(0,54));
-  display.println("zZZz");
-  display.display();
+  // stay in this loop until a finger lands
+  while (!fingerPlaced){  
+    if (millis() > t){
+      display.clearDisplay();
+      display.setCursor(random(0,98),random(0,54));
+      display.println("zZZz");
+      display.display();
+      t = millis() + i;
+    }
+    fingerPlaced = !digitalRead(SENSOR_TOUT);
+    delay(100); //delay loop as full speed reading will cause the wemos to crash
+  }
+  display.clearDisplay();
+  millis_last_scan = millis();
 }
