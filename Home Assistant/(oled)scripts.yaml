@@ -1,18 +1,61 @@
-fingerprint_sensor_learn_mode:
-  alias: Fingerprint Sensor Learn Mode
-  mode: single
+script:
+  alias: Fingerprint Learn
   sequence:
-  - data_template:
-      payload: "{\n  \"request\": \"learn\",\n  \"id\": \"{{ states('input_number.fingerprint_learning_id')\
-        \ | int }}\"\n}"
-      topic: fingerprint_sensor/1/request
-    service: mqtt.publish
-fingerprint_sensor_delete_mode:
-  alias: Fingerprint Sensor Delete Mode
+    - data:
+        payload_template: |
+          {
+            "request": "learn",
+            "id": "{{states('input_number.fingerprint_manage_id') |int}}",
+            "name": "{{states('input_text.fingerprint_manage_name')}}"
+          }
+        topic: >
+          {% set sensor_id = states('input_number.fingerprint_sensor_id')|int %}
+          {% set topic ="fingerprint_sensor/"+sensor_id|string+"/request"%}
+          {{topic}}
+      service: mqtt.publish
+    - service: input_text.set_value
+      data_template:
+        entity_id: input_text.fingerprint_data
+        value: >
+          {% if states('input_text.fingerprint_data') == "unknown" %} {{"[]"}} {%
+          else %} {{states('input_text.fingerprint_data')}} {% endif %}
+    - service: input_text.set_value
+      data_template:
+        entity_id: input_text.fingerprint_data
+        value: >
+          {% set print_id = states('input_number.fingerprint_manage_id') | int %}
+          {% set key_id = 'id' + print_id|string %} {% set print_name =
+          states('input_text.fingerprint_manage_name') %} {% set prints =
+          states('input_text.fingerprint_data') | from_json if
+          states('input_text.fingerprint_data') else [] %} {{
+          (prints|rejectattr(key_id) | list + [{'id' + print_id|string :
+          print_name}]) |tojson |replace(' ','') }}
   mode: single
+  icon: 'hass:fingerprint'
+
+  alias: Fingerprint Delete
   sequence:
-  - data_template:
-      payload: "{\n  \"request\": \"delete\",\n  \"id\": \"{{ states('input_number.fingerprint_learning_id')\
-        \ | int }}\"\n}"
-      topic: fingerprint_sensor/1/request
-    service: mqtt.publish
+    - data:
+        payload_template: |
+          {
+            "request": "delete",
+            "id": "{{states('input_number.fingerprint_manage_id') |int}}",
+            "name": "{{states('input_text.fingerprint_manage_name')}}"
+          }
+        topic: >
+          {% set sensor_id = states('input_number.fingerprint_sensor_id')|int %}
+          {% set topic ="fingerprint_sensor/"+sensor_id|string+"/request"%}
+          {{topic}}
+      service: mqtt.publish
+    - service: input_text.set_value
+      data_template:
+        entity_id: input_text.fingerprint_data
+        value: >
+          {%- set print_id = states('input_number.fingerprint_manage_id')| int -%}
+          {% set key_id = 'id' + print_id|string %} {%- set prints =
+          states('input_text.fingerprint_data') | from_json if
+          states('input_text.fingerprint_data') else [] -%} {{
+          (prints|rejectattr(key_id)) | list | tojson |replace(' ','')}}
+  mode: single
+  icon: 'hass:fingerprint'
+
