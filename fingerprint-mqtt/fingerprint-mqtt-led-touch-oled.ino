@@ -8,32 +8,30 @@
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
+#include "secrets.h"
 
-// Wifi Settings
-#define SSID                          "Your Wifi SSID Here"
-#define PASSWORD                      "Your Wifi Password Here"
+#define VERSION                       "3.0"
 
 // MQTT Settings
-#define HOSTNAME                      "fingerprint-sensor-1"
-#define MQTT_SERVER                   "Your MQTT Server here"													
-#define AVAILABILITY_TOPIC            "fingerprint_sensor/1/available"
-#define STATE_TOPIC                   "fingerprint_sensor/1/state"        //Publish state changes to this topic
-#define ATTR_TOPIC                    "fingerprint_sensor/1/attributes"   //Publish additional attributes to this topic
-#define REQUEST_TOPIC                 "fingerprint_sensor/1/request"      //Listen here for requests, such as a request to enroll
-#define NOTIFY_TOPIC                  "fingerprint_sensor/1/notify"       //Listen here for text to display on the OLED, such as an automation notification
-
-#define mqtt_username                 "Your MQTT Username"
-#define mqtt_password                 "Your MQTT Password"
+#define HOSTNAME                      "garagedoor-fingerprint-sensor"                  
+#define AVAILABILITY_TOPIC            "garagedoor_fingerprint_sensor/available"
+#define STATE_TOPIC                   "garagedoor_fingerprint_sensor/state"        //Publish state changes to this topic
+#define ATTR_TOPIC                    "garagedoor_fingerprint_sensor/attributes"   //Publish additional attributes to this topic
+#define REQUEST_TOPIC                 "garagedoor_fingerprint_sensor/request"      //Listen here for requests, such as a request to enroll
+#define NOTIFY_TOPIC                  "garagedoor_fingerprint_sensor/notify"       //Listen here for text to display on the OLED, such as an automation notification
+#define WIFI_TOPIC                    "garagedoor_fingerprint_sensor/wifi"       
 
 // Fingerprint Sensor
-#define SENSOR_TX 13                  //GPIO Pin for WEMOS RX, SENSOR TX
-#define SENSOR_RX 12                  //GPIO Pin for WEMOS TX, SENSOR RX
-#define SENSOR_TOUT 14                //GPIO Pin for SENSOR T_OUT
+#define SENSOR_TX 12                  //GPIO Pin for WEMOS RX, SENSOR TX
+#define SENSOR_RX 14                  //GPIO Pin for WEMOS TX, SENSOR RX
+#define SENSOR_TOUT 0                //GPIO Pin for SENSOR T_OUT
 
 // OLED Settings
 #define OLED_RESET -1
 #define SCREENSAVER_ON_DELAY 120      // Idle time before screensaver (in seconds)
 #define SCREENSAVER_REFRESH 15        // Refresh time for the screensaver (in seconds)
+
+#define REFRESH_WIFI_SIGNAL 60        //OLED Update Wifi Signal + Publish Wifi Signal (in seconds)
 
 // OLED Variables
 unsigned long millis_last_scan;       // Stores time of last scan (for screensaver)
@@ -74,13 +72,26 @@ WiFiClient wifiClient;                // Initiate WiFi library
 PubSubClient client(wifiClient);      // Initiate PubSubClient library
 bool wifiState = false;               // Stores wifi connectivity state for OLED
 bool mqttState = false;               // Stores mqtt connectivity state for OLED
+bool ledOnOverwritten = false;
+bool ledOn = false;
+long lastReconnectAttempt = 0;
+int wifiRssi = 0;
+long lastWifiPublish = 0;
+bool screensaverRunning = false;
 
 
 //Declare JSON variables
-DynamicJsonDocument mqttMessage(200);
+DynamicJsonDocument currentAttributes(200);
 char mqttBuffer[200];
 
 void setup(){
+  lastReconnectAttempt = 0;
+  ledOnOverwritten = false;
+  ledOn = false;
+  wifiRssi = 0;
+  lastWifiPublish = 0;
+  screensaverRunning = false;
+  
   // prep OLED
   display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
   display.clearDisplay();
@@ -105,7 +116,8 @@ void setup(){
 
   // connect to wifi
   WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID, PASSWORD);
+  WiFi.hostname(WIFI_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   oledUpdateHeader("WIFI:TRYING", false, false);
   while (WiFi.status() != WL_CONNECTED) {       // Wait till Wifi connected
     delay(1000);
@@ -113,6 +125,7 @@ void setup(){
   wifiState = true;
   oledUpdateHeader("WIFI:CONNECTED", wifiState, false);
   delay(500);
+  wifiRssi = getWifiQuality();
 
 // OTA
   ArduinoOTA.onStart([]() {
@@ -143,6 +156,7 @@ void setup(){
       oledUpdateHeader("END FAIL", wifiState, mqttState);
     }
   });
+  ArduinoOTA.setHostname(WIFI_HOSTNAME);
   ArduinoOTA.begin();
 
   // connect to mqtt server
@@ -156,6 +170,8 @@ void setup(){
   // set initial state
   oledUpdateHeader("STARTUP OK!", wifiState, mqttState);
   publishState("idle");
+  delay(500);
+  oledUpdateWifiPerc();
   delay(5000);                                                            // This delay to give the network a chance to settle, otherwise screen will show a brief reconnect.
 }
 
@@ -165,64 +181,124 @@ void setup(){
 void loop() {
   ArduinoOTA.handle();
   if (WiFi.status() != WL_CONNECTED || !client.connected()){              // if wifi or mqtt are disconnected...
-    while (WiFi.status() != WL_CONNECTED) {                               // if it was wifi...wait for connection
-      oledUpdateHeader("WIFI:TRYING", false, false);                      
+    clearAllButHeader();
+    if(WiFi.status() != WL_CONNECTED)
+    {
+      while (WiFi.status() != WL_CONNECTED) {                               // if it was wifi...wait for connection
+        oledUpdateHeader("WIFI:TRYING", false, false);                      
+        delay(500);
+      }
+      wifiState = true;
+      oledUpdateHeader("WIFI:CONNECTED", wifiState, false);
       delay(500);
     }
-    wifiState = true;
-    oledUpdateHeader("WIFI:CONNECTED", wifiState, false);
-    delay(500);
-    if (!client.connected()) {                                            // if it was mqtt...
-      oledUpdateHeader("MQTT:TRYING", wifiState, false);
-      reconnect();                                                        // this routine waits for a connection
-      oledUpdateHeader("MQTT:CONNECTED", wifiState, mqttState);
-      delay(500);
+
+    if (!client.connected()) {
+        long millisNow = millis();
+        if (millisNow - lastReconnectAttempt > 60000) {
+          oledUpdateHeader("MQTT:TRYING", wifiState, false);
+          lastReconnectAttempt = millisNow;
+          // Attempt to reconnect
+          if (reconnect()) {
+            lastReconnectAttempt = 0;
+            oledUpdateHeader("MQTT:CONNECTED", wifiState, mqttState);
+            delay(500);
+          }
+          else
+          {
+            char state[2];
+            char buf[30];
+            itoa (client.state(),state,10);
+            strcpy(buf,"MQTT:RC=");
+            strcat(buf,state);
+            oledUpdateHeader(buf, wifiState, false);
+            delay(1000);
+          }
+       }
+    }
+    
+  }
+  if(wifiState && mqttState)
+  { 
+    if(millis() > millis_last_scan + SCREENSAVER_ON_DELAY*1000){            // been idle long enough for the screensaver?
+      if (millis() > millis_last_refresh + SCREENSAVER_REFRESH*1000){       // and if so should we refresh the screen image?
+        oledRefreshScreensaver();                                           // refresh the screensaver
+        millis_last_refresh = millis();                                     // reset refresh timer
+      }
+    } else {
+     //String readyText = "READY (v";
+     //String readyText2 = ")";
+     //readyText = readyText + VERSION + readyText2;
+     oledUpdateHeader("READY", wifiState, mqttState);
+     clearAllButHeader();
+    }
+    
+    int fingerState = digitalRead(SENSOR_TOUT);                             // read T-Out, normally HIGH (when no finger)
+    if (fingerState == HIGH) {                                              // if no finger turn off the LED
+      fingerprintLed(false);
+    } else {                                                                // otherwise something is present...
+      oledUpdateHeader("HOLD STILL", wifiState, mqttState);
+      oledTextSwipeUp("SCANNING",2,18,64,30,10); 
+      delay(250);                                                           // this delay plus the animation above gives the finger time to land and settle for a good read
+      uint8_t result = getFingerprintID();                                  // read fingerprint
+      delay(500);                                                           // this delay is purely for the OLED UI
+      if (result == FINGERPRINT_OK) {                                       // if matched...
+        publishAttr("matched",id,confidenceScore);
+        publishState("matched");
+        oledUpdateHeader("SENDING", wifiState, mqttState);
+        oledTextSwipeDown("MATCHED",2,25,30,64,10);
+        delay(500);
+      } else if (result == FINGERPRINT_NOTFOUND) {                          // if not matched...
+        publishAttr("not matched",0,0);
+        publishState("not matched");
+        oledUpdateHeader("SENDING", wifiState, mqttState);
+        oledTextSwipeDown("CHECKING",2,16,30,64,10);
+        delay(500);
+      } else {                                                              // in any other case...
+        publishAttr("bad scan",0,0);
+        publishState("bad scan");
+        oledTextSwipeDown("CHECKING",2,16,30,64,10);
+      }
+      publishState("idle");
+      millis_last_scan = millis();
+    }
+
+    long wifiMillisNow = millis();
+    if (wifiMillisNow - lastWifiPublish > (REFRESH_WIFI_SIGNAL*1000)) {
+      wifiRssi = getWifiQuality();
+      lastWifiPublish = wifiMillisNow;
+      publishWifi();
+      oledUpdateWifiPerc();
     }
   }
- 
-  if(millis() > millis_last_scan + SCREENSAVER_ON_DELAY*1000){            // been idle long enough for the screensaver?
-    if (millis() > millis_last_refresh + SCREENSAVER_REFRESH*1000){       // and if so should we refresh the screen image?
-      oledRefreshScreensaver();                                           // refresh the screensaver
-      millis_last_refresh = millis();                                     // reset refresh timer
-    }
-  } else {
-   oledUpdateHeader("READY", wifiState, mqttState);
+
+  // and now wait for 1s, regularly calling the mqtt loop function
+  for (int i=0; i<100; i++) {
+    client.loop();
+    delay(1);
   }
-  
-  int fingerState = digitalRead(SENSOR_TOUT);                             // read T-Out, normally HIGH (when no finger)
-  if (fingerState == HIGH) {                                              // if no finger turn off the LED
-    finger.LEDcontrol(false);
-  } else {                                                                // otherwise something is present...
-    oledUpdateHeader("HOLD STILL", wifiState, mqttState);
-    oledTextSwipeUp("SCANNING",2,18,64,30,10); 
-    delay(250);                                                           // this delay plus the animation above gives the finger time to land and settle for a good read
-    uint8_t result = getFingerprintID();                                  // read fingerprint
-    delay(500);                                                           // this delay is purely for the OLED UI
-    if (result == FINGERPRINT_OK) {                                       // if matched...
-      publishAttr("matched",id,confidenceScore);
-      publishState("matched");
-      oledUpdateHeader("SENDING", wifiState, mqttState);
-      oledTextSwipeDown("MATCHED",2,25,30,64,10);
-      delay(500);
-    } else if (result == FINGERPRINT_NOTFOUND) {                          // if not matched...
-      publishAttr("not matched",0,0);
-      publishState("not matched");
-      oledUpdateHeader("SENDING", wifiState, mqttState);
-      oledTextSwipeDown("CHECKING",2,16,30,64,10);
-      delay(500);
-    } else {                                                              // in any other case...
-      publishAttr("bad scan",0,0);
-      publishState("bad scan");
-      oledTextSwipeDown("CHECKING",2,16,30,64,10);
-    }
-    publishState("idle");
-    millis_last_scan = millis();
-  }
-  client.loop();
-  delay(100);                                                             //don't need to run this at full speed.
 }
 
 
+
+
+int getWifiQuality()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        return -1;
+    }
+    int dBm = WiFi.RSSI();
+    if (dBm <= -100)
+    {
+        return 0;
+    }
+    if (dBm >= -50)
+    {
+        return 100;
+    }
+    return 2 * (dBm + 100);
+}
 
 
 
@@ -233,14 +309,14 @@ void loop() {
 ///////////////////////////////////////////////////////////////////////
 
 uint8_t getFingerprintID() {
-  finger.LEDcontrol(true);
+  fingerprintLed(true);
   oledTextSwipeLeft("SCANNING",18,30,"CHECKING",16,30,15);
   uint8_t p = finger.getImage();
   switch (p) {
     case FINGERPRINT_OK:
       break;
     default:
-      finger.LEDcontrol(false);
+      fingerprintLed(false);
       oledUpdateHeader("IMAGE FAIL", wifiState, mqttState);
       oledShake("CHECKING",16,30);
       return p;
@@ -251,7 +327,7 @@ uint8_t getFingerprintID() {
     case FINGERPRINT_OK:
       break;
     default:
-      finger.LEDcontrol(false);
+      fingerprintLed(false);
       oledUpdateHeader("CONVERT FAIL", wifiState, mqttState);
       oledShake("CHECKING",16,30);
       return p;
@@ -260,18 +336,18 @@ uint8_t getFingerprintID() {
   p = finger.fingerFastSearch();
   switch (p) {
     case FINGERPRINT_OK:
-      finger.LEDcontrol(false);
+      fingerprintLed(false);
       id = finger.fingerID;
       confidenceScore = finger.confidence;
       oledTextSwipeLeft("CHECKING",16,30,"MATCHED",25,30,15);
       return p;
     case FINGERPRINT_NOTFOUND:
-      finger.LEDcontrol(false);
+      fingerprintLed(false);
       oledUpdateHeader("UNAUTHORIZED", wifiState, mqttState);
       oledShake("CHECKING",16,30);
       return p;
     default:
-      finger.LEDcontrol(false);
+      fingerprintLed(false);
       oledUpdateHeader("SEARCH FAIL", wifiState, mqttState);
       oledShake("CHECKING",16,30);
       return p;
@@ -282,7 +358,7 @@ bool getFingerprintEnroll(int enrollID) {
   // function variables
   int p = -1;
   bool fingerPlaced = !digitalRead(SENSOR_TOUT);  
-  finger.LEDcontrol(false);
+  fingerprintLed(false);
   oledTextSwipeUp("PLACE",2,35,64,30,10); // instruct user to place finger
   
   // now we loop twice and save 2 print images 
@@ -294,7 +370,7 @@ bool getFingerprintEnroll(int enrollID) {
       delay(100); //delay loop as full speed reading will cause the wemos to crash
     }
     // something landed...      
-    finger.LEDcontrol(true);
+    fingerprintLed(true);
     oledTextSwipeLeft("PLACE",35,30,"SCANNING",18,30,15);  // use animation delay to let the finger settle    
     // image it...
     while (finger.getImage() != FINGERPRINT_OK) {}     // loop until we get fingerprint_ok
@@ -320,7 +396,7 @@ bool getFingerprintEnroll(int enrollID) {
       return false;
     }
     // instruct user to remove finger and wait until they do
-    finger.LEDcontrol(false);
+    fingerprintLed(false);
     oledTextSwipeLeft("SCANNING",18,30,"REMOVE",30,30,15);
     while (fingerPlaced){  //wait here for finger to leave
       fingerPlaced = !digitalRead(SENSOR_TOUT);
@@ -398,6 +474,15 @@ bool deleteFingerprint(int deleteID) {
     return false;
   }
 }
+void fingerprintLed(bool turnOn)
+{
+  if(turnOn == ledOn || (ledOnOverwritten == true && turnOn == false))
+  {
+    return;
+  }
+  finger.LEDcontrol(turnOn);
+  ledOn = turnOn;
+}
 
 
 
@@ -409,18 +494,22 @@ bool deleteFingerprint(int deleteID) {
 //MQTT FUNCTIONS///////////////////////////////////////////////////////
 ///////////////////////////////////////////////////////////////////////
 
-void reconnect() {
-  while (!client.connected()) {       // Loop until connected to MQTT server
-    if (client.connect(HOSTNAME, mqtt_username, mqtt_password, AVAILABILITY_TOPIC, 1, true, "offline")) {       //Connect to MQTT server
-      client.publish(AVAILABILITY_TOPIC, "online");         // Once connected, publish online to the availability topic
+bool reconnect() {
+  if(!client.connected())
+  {    
+    randomSeed(micros());
+    
+    String clientId = HOSTNAME;
+    clientId += "-";
+    clientId += String(random(0xffff), HEX);
+    if (client.connect(clientId.c_str(), MQTT_USERNAME, MQTT_PASSWORD, AVAILABILITY_TOPIC, 2, true, "offline")) {       //Connect to MQTT server
+      client.publish(AVAILABILITY_TOPIC, "online", true);         // Once connected, publish online to the availability topic
       client.subscribe(REQUEST_TOPIC);
       client.subscribe(NOTIFY_TOPIC);
-      mqttState = true;
-    } else {
-      delay(5000);  // Will attempt connection again in 5 seconds
-      mqttState = false;
     }
   }
+  mqttState = client.connected();
+  return mqttState;
 }
 void callback(char* topic, byte* payload, unsigned int length) {          //The MQTT callback which listens for incoming messages on the subscribed topics
   int i;
@@ -434,11 +523,29 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
       payloadChar[i] = payload[i];
     }
     // second deserialize json payload and save variables
-    StaticJsonDocument<200> doc;
-    deserializeJson(doc, payloadChar);
+    const int capacity = JSON_OBJECT_SIZE(4);
+    StaticJsonDocument<capacity> doc;
+    DeserializationError error = deserializeJson(doc, payloadChar);
+    if (error) {
+        const char* m1 = "deserialJson failed";
+        char messageTxt1[20];  
+        for (i=0; i<20; i++){ 
+          messageTxt1[i] = m1[i];
+        }
+        const char* m2 = error.c_str(); 
+        char messageTxt2[20];  
+        for (i=0; i<20; i++){ 
+          messageTxt2[i] = m2[i];
+        }
+        oledUpdateHeader("ERROR", wifiState, mqttState);
+        oled2TextSwipeUp(messageTxt1, messageTxt2,1,oledGetX(messageTxt1, 5, 1, 128), oledGetX(messageTxt2, 5, 1, 128),64,30,10);
+        delay(5000);
+        return;
+    }
     const char* requestVal = doc["request"];
     const char* idChar = doc["id"];
     const char* nameVal = doc["name"];
+    const char* cmdVal = doc["cmd"];
     const uint8_t id = atoi(doc["id"]);
     //if learning...
     if (strcmp(requestVal, "learn") == 0) {
@@ -487,6 +594,16 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
         delay(2000);
       }
     }
+    // if led...
+    if (strcmp(requestVal, "led") == 0) {  
+      if (strcmp(cmdVal, "on") == 0){
+        fingerprintLed(true);
+        ledOnOverwritten = true;
+      } else if (strcmp(cmdVal, "off") == 0) { 
+        ledOnOverwritten = false;
+        fingerprintLed(false);
+      }
+    }
   }
   // display the notification from the server
   if (strcmp(topic, NOTIFY_TOPIC) == 0){
@@ -499,35 +616,66 @@ void callback(char* topic, byte* payload, unsigned int length) {          //The 
     StaticJsonDocument<200> doc;
     deserializeJson(doc, payloadChar);
     const char* h = doc["header"];
-    char headerTxt[16];  //limit the header text to 16 characters
-    for (i=0; i<15; i++){ //this loop to move char pointer out as can't cast directly to oledUpdateHeader
+    char headerTxt[20];  //limit the header text to 20 characters
+    for (i=0; i<20; i++){ //this loop to move char pointer out as can't cast directly to oledUpdateHeader
       headerTxt[i] = h[i];
     }
     const char* m = doc["message"];  //limit the header text to 16 characters
-    char messageTxt[16];  //limit the message text to 16 characters
-    for (i=0; i<15; i++){ //this next loop to move char pointer out as can't cast to oledUpdateHeader
+    char messageTxt[20];  //limit the message text to 20 characters
+    for (i=0; i<20; i++){ //this next loop to move char pointer out as can't cast to oledUpdateHeader
       messageTxt[i] = m[i];
     }
     //then display it
     oledUpdateHeader("NOTIFICATION", wifiState, mqttState);
-    oledTextSwipeUp(messageTxt,1,oledGetX(messageTxt, 5, 1, 128),64,30,10);
-    delay(1500);
-    oledTextSwipeDown(messageTxt,1,oledGetX(messageTxt, 5, 1, 128),30,64,10);
+    oled2TextSwipeUp(headerTxt, messageTxt,1,oledGetX(headerTxt, 5, 1, 128), oledGetX(messageTxt, 5, 1, 128),64,30,10);
+    delay(5000);
   }
   publishState("idle");
 }
+
+
+
 void publishState(char* state){
 //  mqttMessage["state"] = state;
 //  size_t mqttMessageSize = serializeJson(mqttMessage, mqttBuffer);
-  client.publish(STATE_TOPIC, state);
+  if(client.connected())
+  {
+    client.publish(STATE_TOPIC, state);
+  }
 }
 void publishAttr(char* state,int id, int conf){
-  mqttMessage["last_state"] = state;
-  mqttMessage["last_id"] = id;
-  mqttMessage["last_confidence"] = conf;
-  size_t mqttMessageSize = serializeJson(mqttMessage, mqttBuffer);
-  client.publish(ATTR_TOPIC, mqttBuffer, mqttMessageSize);
+  if(client.connected())
+  {
+    currentAttributes["last_state"] = state;
+    currentAttributes["last_id"] = id;
+    currentAttributes["last_confidence"] = conf;
+    currentAttributes["software_version"] = VERSION;
+    //currentAttributes["wifi_signal"] = wifiRssi;
+    size_t mqttMessageSize = serializeJson(currentAttributes, mqttBuffer);
+    client.publish(ATTR_TOPIC, mqttBuffer, mqttMessageSize);
+  }
 }
+void publishWifiAttr()
+{
+  if(client.connected())
+  {
+    currentAttributes["wifi_signal"] = wifiRssi;
+    size_t mqttMessageSize = serializeJson(currentAttributes, mqttBuffer);
+    client.publish(ATTR_TOPIC, mqttBuffer, mqttMessageSize);
+  }
+}
+
+void publishWifi()
+{
+  if(client.connected())
+  {
+    char cRssi[3];
+    String sRssi = String(wifiRssi);
+    sRssi.toCharArray(cRssi, 3);
+    client.publish(WIFI_TOPIC, cRssi);
+  }
+}
+
 
 
 
@@ -553,55 +701,81 @@ void oledUpdateHeader(char* textStr, bool wifi, bool mqtt) {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 3);
-    display.println(textStr);
+    display.print(textStr);
   }
-  if(wifi){
-    display.fillRect(100, 0, 12, 12, SSD1306_BLACK);
-    display.drawBitmap(100, 0, wifi_conn_ico, 12, 12, WHITE);
-  }else{
-    display.fillRect(100, 0, 12, 12, SSD1306_BLACK);
-    display.drawBitmap(100, 0, wifi_disc_ico, 12, 12, WHITE);
-  }
+
   if(mqtt){
-    display.fillRect(116, 0, 12, 12, SSD1306_BLACK);
-    display.drawBitmap(116, 0, mqtt_conn_ico, 12, 12, WHITE);
+    display.fillRect(78, 0, 12, 12, SSD1306_BLACK);
+    display.drawBitmap(78, 0, mqtt_conn_ico, 12, 12, WHITE);
   }else{
-    display.fillRect(116, 0, 12, 12, SSD1306_BLACK);
-    display.drawBitmap(116, 0, mqtt_disc_ico, 12, 12, WHITE);
+    display.fillRect(78, 0, 12, 12, SSD1306_BLACK);
+    display.drawBitmap(78, 0, mqtt_disc_ico, 12, 12, WHITE);
   }
-  display.display();
+  
+  if(wifi){
+    display.fillRect(94, 0, 12, 12, SSD1306_BLACK);
+    display.drawBitmap(94, 0, wifi_conn_ico, 12, 12, WHITE);
+  }else{
+    display.fillRect(94, 0, 12, 12, SSD1306_BLACK);
+    display.drawBitmap(94, 0, wifi_disc_ico, 12, 12, WHITE);
+  }
+}
+void oledUpdateWifiPerc()
+{
+  if(!screensaverRunning)
+  {
+    String sWifiRssi = String(wifiRssi);
+    String wifiText = sWifiRssi + "%";
+    display.fillRect(110, 0, 18, 12, SSD1306_BLACK);
+    display.setTextSize(1);
+    display.setCursor(110, 3);
+    display.println(wifiText);
+    display.display();
+  }
 }
 void oledTextSwipeUp(char* textStr, int textSize, int x, int yStart, int yEnd, int steps) {
-  display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
   display.setTextSize(textSize);
   display.setTextColor(SSD1306_WHITE);
   for(int16_t i=yStart; i>=yEnd; i=i-steps) {
     if(i-steps < yEnd){i = yEnd;} //enforce i ends at y
-    display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
+    clearAllButHeader();
     display.setCursor(x, i);
     display.println(textStr);
     display.display();
   }
 }
+
+void oled2TextSwipeUp(char* textStr1, char* textStr2, int textSize, int x1, int x2, int yStart, int yEnd, int steps) {
+  display.setTextSize(textSize);
+  display.setTextColor(SSD1306_WHITE);
+  for(int16_t i=yStart; i>=yEnd; i=i-steps) {
+    if(i-steps < yEnd){i = yEnd;} //enforce i ends at y
+    clearAllButHeader();
+    display.setCursor(x1, i);
+    display.println(textStr1);
+    display.setCursor(x2, i + 10);
+    display.println(textStr2);
+    display.display();
+  }
+}
+
 void oledTextSwipeDown(char* textStr, int textSize, int x, int yStart, int yEnd, int steps) {
-  display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
   display.setTextSize(textSize);
   display.setTextColor(SSD1306_WHITE);
   for(int16_t i = 0; i <= yEnd; i = i + steps) {
-    display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
+    clearAllButHeader();
     display.setCursor(x, yStart + i);
     display.println(textStr);
     display.display();
   }
 }
 void oledTextSwipeLeft(char* textStr1, int xStart, int yStart, char* textStr2, int xEnd, int yEnd, int steps) {
-  display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
   display.setTextSize(2);
   display.setTextWrap(false);
   display.setTextColor(SSD1306_WHITE);
   for(int16_t i = 150; i >= xEnd; i = i - steps) {
     if(i-steps < xEnd){i = xEnd;} //enforce i ends at x
-    display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
+    clearAllButHeader();
     display.setCursor(xStart-(150-i), yStart);
     display.println(textStr1);
     display.setCursor(i, yEnd);
@@ -610,13 +784,12 @@ void oledTextSwipeLeft(char* textStr1, int xStart, int yStart, char* textStr2, i
   }
 }
 void oledShake(char* textStr, int xStart, int yStart) {
-  display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
   display.setTextSize(2);
   display.setTextWrap(false);
   display.setTextColor(SSD1306_WHITE);
   int s=3; //shake dist
   for(int16_t i=0; i<=10; i++) {
-    display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
+    clearAllButHeader();
     if(i % 2 == 0) {
       display.setCursor(xStart + s, yStart);
     } else {
@@ -624,17 +797,23 @@ void oledShake(char* textStr, int xStart, int yStart) {
     }
     display.println(textStr);
     display.display();
-    display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
+    clearAllButHeader();
     display.setCursor(xStart, yStart);
     display.println(textStr);
     display.display();
   }
 }
 void oledRefreshScreensaver(){
+  screensaverRunning = true;
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(random(0,98),random(0,54));
   display.println("zZZz");
   display.display();
+}
+
+void clearAllButHeader()
+{
+  display.fillRect(0, 13, 128, 51, SSD1306_BLACK); //clear all but header
 }
